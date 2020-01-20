@@ -418,15 +418,21 @@ Will run all DDL in db1 and let it replicate ddl to db2, so *sync-ddl* should be
 if loop is true will run again and again unless meet some error.
 	`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dsn1 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user, password, host, port)
-		dsn2 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user2, password2, host2, port2)
+		for {
+			dsn1 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user, password, host, port)
+			dsn2 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user2, password2, host2, port2)
 
-		err := testDML(dsn1, dsn2, n, p, session, opNumber)
-		if err != nil {
-			return errors.Trace(err)
+			err := testDML(dsn1, dsn2, n, p, session, opNumber)
+			if err != nil {
+				return errors.Trace(err)
+			}
+
+			log.Info("test success")
+
+			if !loop {
+				break
+			}
 		}
-
-		log.Info("test success")
 
 		return nil
 	},
