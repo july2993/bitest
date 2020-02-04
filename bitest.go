@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -129,6 +131,44 @@ func setGloableVar(dsn string, increment int, offset int) error {
 	return nil
 }
 
+func setupVarAndDB(dsn1 string, dsn2 string, p int, session bool) (db1 *sql.DB, db2 *sql.DB, err error) {
+	// setup increment & offset variable
+	if session {
+		dsn1 += fmt.Sprintf("&auto_increment_increment=%d&auto_increment_offset=%d", 2 /*increment*/, 1 /*offset*/)
+		dsn2 += fmt.Sprintf("&auto_increment_increment=%d&auto_increment_offset=%d", 2, 2)
+	} else {
+		err := setGloableVar(dsn1, 2 /*increment*/, 1 /*offset*/)
+		if err != nil {
+			return nil, nil, errors.Trace(err)
+		}
+		log.Info("set global var success for db1")
+
+		err = setGloableVar(dsn2, 2, 2)
+		if err != nil {
+			return nil, nil, errors.Trace(err)
+		}
+		log.Info("set global var success for db2")
+	}
+
+	db1, err = sql.Open("mysql", dsn1)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+
+	db1.SetMaxIdleConns(p)
+	db1.SetMaxOpenConns(p)
+
+	db2, err = sql.Open("mysql", dsn2)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+
+	db2.SetMaxIdleConns(p)
+	db2.SetMaxOpenConns(p)
+
+	return
+}
+
 func testAutoIncrementAndOffset(dsn string, n int64, p int, increment int, offset int, session bool) error {
 	if session {
 		dsn += fmt.Sprintf("&auto_increment_increment=%d&auto_increment_offset=%d", increment, offset)
@@ -189,11 +229,162 @@ func checkData(timeout time.Duration, db1 *sql.DB, db2 *sql.DB) error {
 		}
 
 		if time.Since(start) > timeout {
-			return errors.Annotate(err, "failed to check equal")
+			return errors.Errorf("failed to check equal")
 		}
 
 		time.Sleep(time.Second * 10)
 	}
+}
+
+// keep inserting and do random add -> change(int -> bigint) -> drop column
+func testAddDropColumn(dsn1 string, dsn2 string, p int, session bool) error {
+	log.Info("config", zap.String("dsn1", dsn1),
+		zap.String("dsn2", dsn2),
+		zap.Int("p", p),
+		zap.Bool("session", session))
+
+	db1, db2, err := setupVarAndDB(dsn1, dsn2, p, session)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	columnTypes := []string{" int default 1", " int not null"}
+
+	for _, cType := range columnTypes {
+		cName := "c" + strconv.Itoa(rand.Intn(1000))
+		// setup table on db1
+		err = setupAutoIncrementAndOffset(db1)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		// the table will replicate to db2
+		err = checkData(defaultCheckDataTimeout, db1, db2)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		keepInsert := func(db *sql.DB, stop chan struct{}) error {
+			for {
+				// ERROR 1364 (HY000): Field 'c1' doesn't have a default value)
+				select {
+				case <-stop:
+					return nil
+				default:
+				}
+
+				_, err := db.Exec("insert into auto1(v) values(?)", rand.Int31())
+				if err != nil {
+					// ERROR 1364 (HY000): Field 'c1' doesn't have a default value)
+					// ignore doesn't have default value
+					if !strings.Contains(err.Error(), "have a default value") {
+						return err
+					}
+				}
+
+				_, err = db.Exec(fmt.Sprintf("insert into auto1(v, %s) values(?, ?)", cName), rand.Int31(), rand.Int31())
+				if err != nil {
+					// ignore unknown column
+					if !strings.Contains(err.Error(), "unknown column") {
+						return err
+					}
+				}
+			}
+		}
+
+		startInsert := func() (egp *errgroup.Group, stop chan struct{}) {
+			stopInsert := make(chan struct{})
+			var eg errgroup.Group
+			for i := 0; i < p; i++ {
+				eg.Go(func() error {
+					return keepInsert(db1, stopInsert)
+				})
+				eg.Go(func() error {
+					return keepInsert(db2, stopInsert)
+				})
+			}
+
+			return &eg, stopInsert
+		}
+
+		var err error
+
+		// add column
+		eg, stop := startInsert()
+		time.Sleep(time.Second)
+
+		sql := fmt.Sprintf("alter table auto1 add column %s %s;", cName, cType)
+		_, err = db1.Exec(sql)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		log.Info("run ddl success", zap.String("sql", sql))
+		time.Sleep(time.Second)
+
+		close(stop)
+		err = eg.Wait()
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		err = checkData(defaultCheckDataTimeout, db1, db2)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		log.Info("pass check data equal after add column")
+
+		// change column int -> bigint
+		eg, stop = startInsert()
+		time.Sleep(time.Second)
+
+		sql = fmt.Sprintf("alter table auto1 modify column %s %s;", cName, strings.Replace(cType, "int", "bigint", -1))
+		_, err = db1.Exec(sql)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		log.Info("run ddl success", zap.String("sql", sql))
+		time.Sleep(time.Second)
+
+		close(stop)
+		err = eg.Wait()
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		err = checkData(defaultCheckDataTimeout, db1, db2)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		log.Info("pass check data equal after change column")
+
+		// drop column
+		eg, stop = startInsert()
+		time.Sleep(time.Second)
+
+		sql = fmt.Sprintf("alter table auto1 drop column %s;", cName)
+		_, err = db1.Exec(sql)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		log.Info("run ddl success", zap.String("sql", sql))
+		time.Sleep(time.Second)
+
+		close(stop)
+		err = eg.Wait()
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		err = checkData(defaultCheckDataTimeout, db1, db2)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		log.Info("pass check data equal after drop column")
+	}
+
+	return nil
 }
 
 func testDML(dsn1 string, dsn2 string, n int64, p int, session bool, opNumber int64) error {
@@ -203,41 +394,11 @@ func testDML(dsn1 string, dsn2 string, n int64, p int, session bool, opNumber in
 		zap.Int("p", p),
 		zap.Bool("session", session),
 		zap.Int64("op-number", opNumber))
-	// setup increment & offset variable
-	if session {
-		dsn1 += fmt.Sprintf("&auto_increment_increment=%d&auto_increment_offset=%d", 2 /*increment*/, 1 /*offset*/)
-		dsn2 += fmt.Sprintf("&auto_increment_increment=%d&auto_increment_offset=%d", 2, 2)
-	} else {
-		err := setGloableVar(dsn1, 2 /*increment*/, 1 /*offset*/)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		log.Info("set global var success for db1")
 
-		err = setGloableVar(dsn2, 2, 2)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		log.Info("set global var success for db2")
-	}
-
-	db1, err := sql.Open("mysql", dsn1)
+	db1, db2, err := setupVarAndDB(dsn1, dsn2, p, session)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	defer db1.Close()
-
-	db1.SetMaxIdleConns(p)
-	db1.SetMaxOpenConns(p)
-
-	db2, err := sql.Open("mysql", dsn2)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	defer db2.Close()
-
-	db2.SetMaxIdleConns(p)
-	db2.SetMaxOpenConns(p)
 
 	// setup table on db1
 	err = setupAutoIncrementAndOffset(db1)
@@ -438,9 +599,26 @@ if loop is true will run again and again unless meet some error.
 	},
 }
 
+var ddlCmd = &cobra.Command{
+	Use: "ddl",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dsn1 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user, password, host, port)
+		dsn2 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user2, password2, host2, port2)
+		err := testAddDropColumn(dsn1, dsn2, p, session)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		log.Info("test add/change(int -> bigint)/drop column success")
+
+		return nil
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(offsetCmd)
 	rootCmd.AddCommand(dmlCmd)
+	rootCmd.AddCommand(ddlCmd)
 
 	// offsetCmd
 	offsetCmd.Flags().StringVar(&user, "user", "root", "user of db")
@@ -471,6 +649,20 @@ func init() {
 	dmlCmd.Flags().BoolVar(&session, "session", true, "set the variable by session or not")
 	dmlCmd.Flags().Int64Var(&opNumber, "op-number", 10000, "random number of Insert/Update/delete after filling n rows")
 	dmlCmd.Flags().BoolVar(&loop, "loop", false, "run test in loop only quit if meet error")
+
+	// ddlCmd
+	ddlCmd.Flags().StringVar(&user, "user", "root", "user of db")
+	ddlCmd.Flags().StringVar(&password, "psw", "", "password of db")
+	ddlCmd.Flags().StringVar(&host, "host", "127.0.0.1", "host of db")
+	ddlCmd.Flags().IntVar(&port, "port", 4000, "port of db")
+
+	ddlCmd.Flags().StringVar(&user2, "user2", "root", "user of db")
+	ddlCmd.Flags().StringVar(&password2, "psw2", "", "password of db")
+	ddlCmd.Flags().StringVar(&host2, "host2", "127.0.0.1", "host of db")
+	ddlCmd.Flags().IntVar(&port2, "port2", 5000, "port of db")
+
+	ddlCmd.Flags().IntVar(&p, "p", 16, "max open connection to db concurrently")
+	ddlCmd.Flags().BoolVar(&session, "session", true, "set the variable by session or not")
 }
 
 func main() {
