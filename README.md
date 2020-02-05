@@ -67,3 +67,28 @@ Flags:
       --user string     user of db (default "root")
       --user2 string    user of db (default "root")
 ```
+
+### bitest ddl
+
+```
+➜  bitest git:(master) ✗ ./bitest ddl -h
+
+        test some DDL and DML currently and data still consistent finally.
+        will add/drop/change column now
+
+Usage:
+  bitest ddl [flags]
+
+Flags:
+  -h, --help           help for ddl
+      --host string    host of db (default "127.0.0.1")
+      --host2 string   host of db (default "127.0.0.1")
+      --p int          max open connection to db concurrently (default 16)
+      --port int       port of db (default 4000)
+      --port2 int      port of db (default 5000)
+      --psw string     password of db
+      --psw2 string    password of db
+      --session        set the variable by session or not (default true)
+      --user string    user of db (default "root")
+      --user2 string   user of db (default "root")
+```

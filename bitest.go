@@ -601,6 +601,10 @@ if loop is true will run again and again unless meet some error.
 
 var ddlCmd = &cobra.Command{
 	Use: "ddl",
+	Long: `
+	test some DDL and DML currently and data still consistent finally.
+	will add/drop/change column now
+`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dsn1 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user, password, host, port)
 		dsn2 := fmt.Sprintf("%s:%s@tcp(%s:%d)/test?interpolateParams=true&readTimeout=1m&multiStatements=true", user2, password2, host2, port2)
