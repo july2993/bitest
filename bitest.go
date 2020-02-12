@@ -406,6 +406,10 @@ func testDML(dsn1 string, dsn2 string, n int64, p int, session bool, opNumber in
 		return errors.Trace(err)
 	}
 
+	// just in case the downstream's table is dropped and the create table sql is not replicated yet
+	// the diff will fail while check the data equals.(It see the table exist but the table is drop when it try to check data).
+	time.Sleep(time.Second * 3)
+
 	// the table will replicate to db2
 	err = checkData(defaultCheckDataTimeout, db1, db2)
 	if err != nil {
